@@ -11,6 +11,36 @@ const ai = new OpenAI({ apiKey: config.openaiKey })
 // Base URL API endpoint.
 const API_URL = config.apiBaseUrl
 
+//webhook
+export async function registerWebhook (webhookUrl, device) {
+  const url = `${API_URL}/webhooks`
+
+  // Fetch existing webhooks
+  const { data: webhooks } = await axios.get(url, { headers: { Authorization: config.apiKey } })
+
+  // Check if an active webhook already exists
+  const existing = webhooks.find(webhook => (
+    webhook.url === webhookUrl &&
+    webhook.device === device.id &&
+    webhook.status === 'active' &&
+    webhook.events.includes('message:in:new')
+  ))
+
+  if (existing) {
+    console.log('[info] Webhook is already active:', webhookUrl)
+    return existing
+  }
+
+  console.log('[info] Registering new webhook:', webhookUrl)
+  await axios.post(url, {
+    url: webhookUrl,
+    name: 'Chatbot',
+    events: ['message:in:new'],
+    device: device.id
+  }, { headers: { Authorization: config.apiKey } })
+
+  console.log('[info] Webhook successfully registered:', webhookUrl)
+}
 // Function to send a message using the Wassenger API
 export async function sendMessage ({ phone, message, media, device, ...fields }) {
   const url = `${API_URL}/messages`
