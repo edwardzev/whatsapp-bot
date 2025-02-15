@@ -1,134 +1,167 @@
-import fs from 'fs';
-import axios from 'axios';
-import OpenAI from 'openai';
-import config from './config.js';
-import { state, cache, cacheTTL } from './store.js';
+
+import fs from 'fs'
+import axios from 'axios'
+import OpenAI from 'openai'
+import config from './config.js'
+import { state, cache, cacheTTL } from './store.js'
 
 // Initialize OpenAI client
-const ai = new OpenAI({ apiKey: config.openaiKey });
+const ai = new OpenAI({ apiKey: config.openaiKey })
 
-// Base URL API endpoint (Wassenger)
-const API_URL = config.apiBaseUrl || 'https://api.wassenger.com/v1';
-
-// Webhook URL (set manually if not in config)
-const WEBHOOK_URL = config.webhookUrl || 'https://webhook.outbrand.co.il/webhook';
+// Base URL API endpoint.
+const API_URL = config.apiBaseUrl
 
 // Function to send a message using the Wassenger API
-export async function sendMessage({ phone, message, media, device, ...fields }) {
-  const url = `${API_URL}/messages`;
-  const body = {
-    phone,
-    message,
-    media,
-    device,
-    ...fields,
-    enqueue: 'never'
-  };
+export async function sendMessage ({ phone, message, media, device, ...fields }) {
+  const url = `${API_URL}/messages`
+  const body = { phone, message, media, device, ...fields, enqueue: 'never' }
 
-  try {
-    const res = await axios.post(url, body, {
-      headers: { Authorization: config.apiKey }
-    });
-    console.log('[info] Message sent:', phone, res.data.id, res.data.status);
-    return res.data;
-  } catch (err) {
-    console.error('[error] Failed to send message:', phone, message || '<no message>', err.response?.data || err);
-    return false;
-  }
-}
-
-// Fetch WhatsApp Team Members
-export async function pullMembers(device) {
-  if (cache.members && (Date.now() - cache.members.time) < cacheTTL) {
-    return cache.members.data;
-  }
-
-  try {
-    const url = `${API_URL}/devices/${device.id}/team`;
-    const { data: members } = await axios.get(url, { headers: { Authorization: config.apiKey } });
-    cache.members = { data: members, time: Date.now() };
-    return members;
-  } catch (err) {
-    console.error('[error] Failed to fetch members:', err.message);
-    return [];
-  }
-}
-
-// Assign Chat to an Agent
-export async function assignChatToAgent({ data, device, force }) {
-  if (!config.enableMemberChatAssignment && !force) {
-    console.log('[debug] Chat assignment is disabled.');
-    return;
-  }
-
-  try {
-    const members = await pullMembers(device);
-    const availableMembers = members.filter(m => m.status === 'active' && config.teamWhitelist.includes(m.id));
-    
-    if (!availableMembers.length) {
-      console.log('[warning] No available team members.');
-      return;
+  let retries = 3
+  while (retries) {
+    retries -= 1
+    try {
+      const res = await axios.post(url, body, { headers: { Authorization: config.apiKey } })
+      console.log('[info] Message sent:', phone, res.data.id, res.data.status)
+      return res.data
+    } catch (err) {
+      console.error('[error] Failed to send message:', phone, message || '<no message>', err.response ? err.response.data : err)
     }
+  }
+  return false
+}
 
-    const assignedMember = availableMembers[Math.floor(Math.random() * availableMembers.length)];
-    console.log('[info] Assigning chat to:', assignedMember.displayName);
+export async function pullMembers (device) {
+  if (cache.members && +cache.members.time && (Date.now() - +cache.members.time) < cacheTTL) {
+    return cache.members.data
+  }
+  const url = `${API_URL}/devices/${device.id}/team`
+  const { data: members } = await axios.get(url, { headers: { Authorization: config.apiKey } })
+  cache.members = { data: members, time: Date.now() }
+  return members
+}
 
-    const url = `${API_URL}/chat/${device.id}/chats/${data.chat.id}/owner`;
-    await axios.patch(url, { agent: assignedMember.id }, { headers: { Authorization: config.apiKey } });
-
-    return assignedMember;
-  } catch (err) {
-    console.error('[error] Failed to assign chat:', err.message);
+export async function validateMembers (members) {
+  const validateMembers = (config.teamWhitelist || []).concat(config.teamBlacklist || [])
+  for (const id of validateMembers) {
+    if (typeof id !== 'string' || id.length !== 24) {
+      return exit('Invalid Team User ID:', id)
+    }
+    const exists = members.some(user => user.id === id)
+    if (!exists) {
+      return exit('Team user ID does not exist:', id)
+    }
   }
 }
 
-// Fetch Chat Messages
-export async function pullChatMessages({ data, device }) {
+export async function createLabels (device) {
+  const labels = cache.labels?.data || []
+  const requiredLabels = (config.setLabelsOnUserAssignment || []).concat(config.setLabelsOnBotChats || [])
+  const missingLabels = requiredLabels.filter(label => labels.every(l => l.name !== label))
+
+  for (const label of missingLabels) {
+    console.log('[info] Creating label:', label)
+    const url = `${API_URL}/devices/${device.id}/labels`
+    const body = { name: label.slice(0, 30).trim(), color: 'blue', description: 'Chatbot label' }
+    try {
+      await axios.post(url, body, { headers: { Authorization: config.apiKey } })
+    } catch (err) {
+      console.error('[error] Failed to create label:', label, err.message)
+    }
+  }
+  if (missingLabels.length) {
+    await pullLabels(device, { force: true })
+  }
+}
+
+export async function pullLabels (device, { force } = {}) {
+  if (!force && cache.labels && +cache.labels.time && (Date.now() - +cache.labels.time) < cacheTTL) {
+    return cache.labels.data
+  }
+  const url = `${API_URL}/devices/${device.id}/labels`
+  const { data: labels } = await axios.get(url, { headers: { Authorization: config.apiKey } })
+  cache.labels = { data: labels, time: Date.now() }
+  return labels
+}
+
+export async function updateChatLabels ({ data, device, labels }) {
+  const url = `${API_URL}/chat/${device.id}/chats/${data.chat.id}/labels`
+  const newLabels = (data.chat.labels || []).concat(labels)
+  console.log('[info] Update chat labels:', data.chat.id, newLabels)
+  await axios.patch(url, newLabels, { headers: { Authorization: config.apiKey } })
+}
+
+export async function updateChatMetadata ({ data, device, metadata }) {
+  const url = `${API_URL}/chat/${device.id}/contacts/${data.chat.id}/metadata`
+  await axios.patch(url, metadata, { headers: { Authorization: config.apiKey } })
+}
+
+export async function pullChatMessages ({ data, device }) {
   try {
-    const url = `${API_URL}/chat/${device.id}/messages/?chat=${data.chat.id}&limit=25`;
-    const res = await axios.get(url, { headers: { Authorization: config.apiKey } });
+    const url = `${API_URL}/chat/${device.id}/messages/?chat=${data.chat.id}&limit=25`
+    const res = await axios.get(url, { headers: { Authorization: config.apiKey } })
     state[data.chat.id] = res.data.reduce((acc, message) => {
-      acc[message.id] = message;
-      return acc;
-    }, state[data.chat.id] || {});
-    return res.data;
+      acc[message.id] = message
+      return acc
+    }, state[data.chat.id] || {})
+    return res.data
   } catch (err) {
-    console.error('[error] Failed to fetch chat messages:', err.message);
-    return [];
+    console.error('[error] Failed to pull chat messages:', err)
   }
 }
 
-// Send "Typing" Status
-export async function sendTypingState({ data, device, action }) {
-  try {
-    const url = `${API_URL}/chat/${device.id}/typing`;
-    await axios.post(url, { action: action || 'typing', duration: 10, chat: data.fromNumber }, { headers: { Authorization: config.apiKey } });
-  } catch (err) {
-    console.error('[error] Failed to send typing state:', err.message);
+// Find an active WhatsApp device connected to the Wassenger API
+export async function loadDevice () {
+  const url = `${API_URL}/devices`
+  const { data } = await axios.get(url, { headers: { Authorization: config.apiKey } })
+  if (config.device) {
+    return data.find(device => device.id === config.device)
   }
+  return data.find(device => device.status === 'operative')
 }
 
-// Webhook Registration (for Local Development)
-export async function registerWebhook(tunnel, device) {
-  const webhookUrl = `${tunnel}/webhook`;
+export async function transcribeAudio ({ message, device }) {
+  if (!message?.media?.id) {
+    return false
+  }
 
   try {
-    const { data: webhooks } = await axios.get(`${API_URL}/webhooks`, { headers: { Authorization: config.apiKey } });
-
-    const existingWebhook = webhooks.find(w => w.url === webhookUrl && w.device === device.id);
-    if (existingWebhook) {
-      return existingWebhook;
+    const url = `${API_URL}/chat/${device.id}/files/${message.media.id}/download`
+    const response = await axios.get(url, {
+      headers: { Authorization: config.apiKey },
+      responseType: 'stream'
+    })
+    if (response.status !== 200) {
+      return false
     }
 
-    await axios.post(`${API_URL}/webhooks`, { url: webhookUrl, name: 'Chatbot', events: ['message:in:new'], device: device.id }, { headers: { Authorization: config.apiKey } });
-    console.log('[info] Webhook registered:', webhookUrl);
+    const tmpFile = `${message.media.id}.mp3`
+    await new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(tmpFile)
+      response.data.pipe(writer)
+      writer.on('finish', resolve)
+      writer.on('error', reject)
+    })
+
+    const transcription = await ai.audio.transcriptions.create({
+      file: fs.createReadStream(tmpFile),
+      model: 'whisper-1',
+      response_format: 'text'
+    })
+    await fs.promises.unlink(tmpFile)
+    return transcription
   } catch (err) {
-    console.error('[error] Failed to register webhook:', err.message);
+    console.error('[error] Failed to transcribe audio:', err.message)
+    return false
   }
 }
 
-// Exit Function for Errors
-export function exit(msg, ...args) {
-  console.error('[error]', msg, ...args);
-  process.exit(1);
+export async function sendTypingState ({ data, device, action }) {
+  const url = `${API_URL}/chat/${device.id}/typing`
+  const body = { action: action || 'typing', duration: 10, chat: data.fromNumber }
+  await axios.post(url, body, { headers: { Authorization: config.apiKey } })
+}
+
+export function exit (msg, ...args) {
+  console.error('[error]', msg, ...args)
+  process.exit(1)
 }
